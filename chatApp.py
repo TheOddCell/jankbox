@@ -23,7 +23,7 @@ class chatApp():
             self.start_sequence(host, wsapp)
         elif opcode == "text" and key == "answer":
             self.on_answer(host, wsapp, result)
-        elif opcode == "action":
+        elif opcode == "client/send":
             self.on_action(host, wsapp, result)
 
     def _actions(self):
@@ -99,7 +99,7 @@ class chatApp():
         threading.Timer(0.05, back_to_textbox).start()
 
     def on_action(self, host, wsapp, result):
-        clicked_id = result.get("action")
+        clicked_id = result.get("body", {}).get("action")
         clicker_id = result.get("from")
         entry = next((e for e in self.history if e["id"] == clicked_id), None)
         if not entry or entry["sender_id"] != clicker_id:
