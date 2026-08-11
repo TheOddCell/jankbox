@@ -1,12 +1,15 @@
-<img src='https://img.shields.io/github/contributors/Pinball3D/jackboxgamesapi.svg'/><img src='https://img.shields.io/github/issues/Pinball3D/jackboxgamesapi.svg'/>
-# jackboxgamesapi
-A simple script that uses the jackbox ecast server to make a playable game.
-
-A simple script that uses the jackbox ecast server to make a playable game. I belive I have every app tag as I have copied the code from jackbox.tv, but if there are any missing, please submit through a pull request.
-
-I was able to obtain the current information by decompiling the .SWF files and looking at api calls. It would be nice to have more functionality such as showing avalible player icons, but I have not been able to crack that. I used [jpexs flash decompiler](https://github.com/jindrapetrik/jpexs-decompiler).
+# Jankbox
+a "engine" for custom apps/games in jackbox with a chat app example
 
 # How To Use
-make an instance of the host() class and input an appTag. Use the appTags enum.
+make an instance of the host() class (in engine.py) and input an appTag, a game object, and optionally a gui object. Use the appTags enum from engine.py.
 
-SEE EXAMPLE.PY
+Run a game directly:
+```
+./launch.py ./engine.py ./chatApp.py QUIPLASH3 -u ./chatAppGUI.py
+```
+
+Pack a game into a standalone onefile executable:
+```
+./packJank.py ./engine.py ./chatApp.py QUIPLASH3 -u ./chatAppGUI.py
+```
