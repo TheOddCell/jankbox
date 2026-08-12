@@ -1,4 +1,5 @@
 import json
+import sys
 import uuid
 import threading
 import http.client
@@ -30,10 +31,14 @@ appTags = Enum('appTags', _appTagValues)
 class host():
     """Generic ecast room/host connection. Game-specific behavior lives in the
     `app` object passed in, which must implement `on_message(host, wsapp, opcode, result)`.
+    If `app` also implements `on_command(host, wsapp, line)`, lines typed on
+    stdin while the host is running are forwarded to it (started once the
+    connection is confirmed live).
 
-    `gui` is optional and must implement `set_code(code)` and `run()`. When given,
-    the websocket connection runs on a background thread so `gui.run()` can own
-    the main thread (required by most GUI toolkits' event loops)."""
+    `gui` is optional and must implement `set_code(code)` and `run()`. When
+    given, the websocket connection runs on a background thread so
+    `gui.run()` can own the main thread (required by most GUI toolkits'
+    event loops)."""
 
     def __init__(self, appTag, app, gui=None):
         self.appTag = appTag.value
@@ -41,6 +46,7 @@ class host():
         self.gui = gui
         self.seq = 0
         self.player_names = {}
+        self._command_thread_started = False
         self._create_room()
 
         if self.gui:
@@ -80,6 +86,18 @@ class host():
             "acl": ["rw *"],
         })
 
+    def _start_command_thread(self, wsapp):
+        if self._command_thread_started or not hasattr(self.app, "on_command"):
+            return
+        self._command_thread_started = True
+        threading.Thread(target=self._read_commands, args=(wsapp,), daemon=True).start()
+
+    def _read_commands(self, wsapp):
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                self.app.on_command(self, wsapp, line)
+
     def connectWS(self):
         def on_message(wsapp, message):
             print(message)
@@ -89,6 +107,8 @@ class host():
 
             if opcode == "client/connected":
                 self.player_names[result.get("id")] = result.get("name", "???")
+            elif opcode == "client/welcome":
+                self._start_command_thread(wsapp)
 
             self.app.on_message(self, wsapp, opcode, result)
 

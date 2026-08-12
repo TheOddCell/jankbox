@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import os
 import sys
@@ -106,17 +107,20 @@ def build_entry_script(engine_path, game_path, ui_path, appTag_name, embed_sourc
 
 def pack(engine_path, game_path, ui_path, appTag_name, output_script_path):
     """Writes a self-contained entry script to output_script_path and runs
-    PyInstaller on it. ui_path may be None (no GUI). Returns the completed
-    subprocess.CompletedProcess."""
+    PyInstaller on it. ui_path may be None (no GUI). PyInstaller's output
+    streams live to the terminal instead of being captured. Returns the
+    completed subprocess.CompletedProcess (stdout/stderr are None since
+    nothing was captured)."""
+    print(f"[pack] writing entry script -> {output_script_path}")
     with open(output_script_path, "w") as f:
         f.write(build_entry_script(engine_path, game_path, ui_path, appTag_name, embed_sources=True))
 
     name = appTag_name.lower()
+    cmd = [sys.executable, "-m", "PyInstaller", "--onefile", "--log-level", "DEBUG", "--name", name, output_script_path]
+    print(f"[pack] running: {' '.join(cmd)}")
     return subprocess.run(
-        [sys.executable, "-m", "PyInstaller", "--onefile", "--name", name, output_script_path],
+        cmd,
         cwd=os.path.dirname(os.path.abspath(output_script_path)),
-        capture_output=True,
-        text=True,
     )
 
 
@@ -132,16 +136,18 @@ def main():
     output = args.output or os.path.join(
         os.path.dirname(os.path.abspath(args.engine)), f"{args.appTag.lower()}.py")
 
+    print(f"[pack] checking engine={args.engine} game={args.game} ui={args.ui} appTag={args.appTag}")
     try:
         check_selection(args.engine, args.game, args.ui, args.appTag)
     except Exception as e:
         print(f"Failed to load modules: {e}", file=sys.stderr)
         sys.exit(1)
+    print("[pack] modules loaded ok, appTag resolved ok")
 
     print(f"Packing {args.appTag} -> {output}")
     result = pack(args.engine, args.game, args.ui, args.appTag, output)
     if result.returncode != 0:
-        print(result.stderr, file=sys.stderr)
+        print(f"[pack] PyInstaller exited with code {result.returncode} (see output above)", file=sys.stderr)
         sys.exit(1)
 
     dist_path = os.path.join(os.path.dirname(os.path.abspath(output)), "dist", args.appTag.lower())
