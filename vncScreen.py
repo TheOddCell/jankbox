@@ -52,14 +52,30 @@ You can also type on this process's own stdin while it's running:
 
 import base64
 import io
+import os
 import threading
 import time
 
 import rfbClient
 
-VNC_HOST = "127.0.0.1"
-VNC_PORT = 5901
-VNC_PASSWORD = None
+
+def _load_dotenv(path=".env"):
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_dotenv()
+
+VNC_HOST = os.environ.get("VNC_HOST", "127.0.0.1")
+VNC_PORT = int(os.environ.get("VNC_PORT", "5901"))
+VNC_PASSWORD = os.environ.get("VNC_PASSWORD") or None
 FPS_CAP = 10
 MAX_WIDTH = 960  # downscale to keep the base64 payload reasonable - bumped up from 480 for legibility
 JPEG_QUALITY = 85
