@@ -103,30 +103,6 @@ MOUSE_MOVES = {
 MOUSE_CLICKS = {"click_left": 1, "click_right": 4}  # RFB button masks: left=1, right=4
 
 
-def _run(fn, *args):
-    try:
-        fn(VNC_HOST, VNC_PORT, *args, VNC_PASSWORD)
-        print(f"[vncScreen] {fn.__name__}{args} ok")
-    except Exception as e:
-        print(f"[vncScreen] {fn.__name__}{args} failed: {e}")
-
-
-def vnc_key(name):
-    threading.Thread(target=_run, args=(rfbClient.key, name), daemon=True).start()
-
-
-def vnc_keydown(name):
-    threading.Thread(target=_run, args=(rfbClient.keydown, name), daemon=True).start()
-
-
-def vnc_keyup(name):
-    threading.Thread(target=_run, args=(rfbClient.keyup, name), daemon=True).start()
-
-
-def vnc_type(text):
-    threading.Thread(target=_run, args=(rfbClient.type_text, text), daemon=True).start()
-
-
 
 
 class vncScreen():
@@ -138,8 +114,17 @@ class vncScreen():
         self._real_size = (MAX_WIDTH, MAX_WIDTH)  # updated each captured frame
         self._sent_size = (MAX_WIDTH, MAX_WIDTH)
         self._mouse_pos = (MAX_WIDTH // 2, MAX_WIDTH // 2)  # tracked in real VNC coordinates
-        self._mouse_lock = threading.Lock()
-        self._mouse_sock = None  # persistent connection, see rfbClient.open_pointer_session
+        # single persistent VNC connection shared by keyboard, mouse, and
+        # frame capture - see _ensure_vnc_session(). One connection instead
+        # of reconnecting per action for the same reason the mouse alone
+        # needed one (see rfbClient.open_pointer_session): reconnecting
+        # resets relative-mouse delta tracking, and it's simply wasteful to
+        # pay a fresh TCP+RFB handshake for every keypress and every frame.
+        self._vnc_lock = threading.Lock()
+        self._vnc_sock = None
+        self._vnc_width = None
+        self._vnc_height = None
+        self._vnc_pixel_format = None
         self._chat_history = []  # [{"id", "sender_id", "text"}, ...], most recent first
         self._next_chat_id = 1
 
@@ -283,27 +268,70 @@ class vncScreen():
             keysym_name = MODIFIER_KEYS[key]
             if key in self._held_modifiers:
                 self._held_modifiers.discard(key)
-                vnc_keyup(keysym_name)
+                self._vnc_keyup(keysym_name)
                 print(f"[vncScreen] released {key}")
             else:
                 self._held_modifiers.add(key)
-                vnc_keydown(keysym_name)
+                self._vnc_keydown(keysym_name)
                 print(f"[vncScreen] holding {key}")
             self._refresh_current_state(host, wsapp)
         elif key in SPECIAL_KEYS:
-            vnc_key(SPECIAL_KEYS[key])
+            self._vnc_key(SPECIAL_KEYS[key])
             print(f"[vncScreen] key {SPECIAL_KEYS[key]}")
 
-    def _ensure_mouse_session(self):
-        """Must be called with self._mouse_lock held."""
-        if self._mouse_sock is None:
+    # --- shared persistent VNC connection (keyboard + mouse + capture) ---
+
+    def _ensure_vnc_session(self):
+        """Must be called with self._vnc_lock held. Connects (and does
+        SetEncodings, needed for frame capture) on first use; reused for
+        every subsequent keyboard, mouse, and capture call."""
+        if self._vnc_sock is None:
             try:
-                self._mouse_sock = rfbClient.open_pointer_session(VNC_HOST, VNC_PORT, VNC_PASSWORD)
-                print("[vncScreen] opened persistent mouse session")
+                sock, width, height, pixel_format = rfbClient.connect(VNC_HOST, VNC_PORT, VNC_PASSWORD)
+                rfbClient.send_set_encodings(sock)
+                self._vnc_sock = sock
+                self._vnc_width, self._vnc_height = width, height
+                self._vnc_pixel_format = pixel_format
+                self._real_size = (width, height)
+                print(f"[vncScreen] opened persistent VNC session ({width}x{height})")
             except Exception as e:
-                print(f"[vncScreen] failed to open mouse session: {e}")
-                self._mouse_sock = None
-        return self._mouse_sock
+                print(f"[vncScreen] failed to open VNC session: {e}")
+                self._vnc_sock = None
+        return self._vnc_sock
+
+    def _vnc_call(self, label, fn):
+        """Runs fn(sock) against the shared connection in a background
+        thread (so a slow/hung call can't block the ecast message loop),
+        under the shared lock so keyboard/mouse/capture never interleave
+        on the wire. Drops the connection on failure so the next call
+        reconnects instead of repeatedly failing on a dead socket."""
+        def run():
+            with self._vnc_lock:
+                sock = self._ensure_vnc_session()
+                if not sock:
+                    return
+                try:
+                    fn(sock)
+                    print(f"[vncScreen] {label} ok")
+                except Exception as e:
+                    print(f"[vncScreen] {label} failed: {e}")
+                    self._vnc_sock = None
+        threading.Thread(target=run, daemon=True).start()
+
+    def _vnc_key(self, name):
+        self._vnc_call(f"key {name}", lambda sock: (
+            rfbClient.send_key_by_name(sock, name, True),
+            rfbClient.send_key_by_name(sock, name, False),
+        ))
+
+    def _vnc_keydown(self, name):
+        self._vnc_call(f"keydown {name}", lambda sock: rfbClient.send_key_by_name(sock, name, True))
+
+    def _vnc_keyup(self, name):
+        self._vnc_call(f"keyup {name}", lambda sock: rfbClient.send_key_by_name(sock, name, False))
+
+    def _vnc_type(self, text):
+        self._vnc_call(f"type {text!r}", lambda sock: rfbClient.send_text(sock, text))
 
     def _move_mouse(self, dx, dy):
         real_w, real_h = self._real_size
@@ -311,53 +339,28 @@ class vncScreen():
         x = max(0, min(real_w - 1, x + dx))
         y = max(0, min(real_h - 1, y + dy))
         self._mouse_pos = (x, y)
-
-        def run():
-            with self._mouse_lock:
-                sock = self._ensure_mouse_session()
-                if not sock:
-                    return
-                try:
-                    rfbClient.send_pointer_event(sock, x, y, 0)
-                    print(f"[vncScreen] mouse move to ({x},{y})")
-                except Exception as e:
-                    print(f"[vncScreen] mouse move failed: {e}")
-                    self._mouse_sock = None
-        threading.Thread(target=run, daemon=True).start()
+        self._vnc_call(f"mouse move to ({x},{y})", lambda sock: rfbClient.send_pointer_event(sock, x, y, 0))
 
     def _click_mouse(self, button_mask):
         x, y = self._mouse_pos
-
-        def run():
-            with self._mouse_lock:
-                sock = self._ensure_mouse_session()
-                if not sock:
-                    return
-                try:
-                    rfbClient.send_pointer_event(sock, x, y, button_mask)
-                    rfbClient.send_pointer_event(sock, x, y, 0)
-                    print(f"[vncScreen] click button_mask={button_mask} at ({x},{y})")
-                except Exception as e:
-                    print(f"[vncScreen] click failed: {e}")
-                    self._mouse_sock = None
-        threading.Thread(target=run, daemon=True).start()
+        self._vnc_call(f"click button_mask={button_mask} at ({x},{y})", lambda sock: (
+            rfbClient.send_pointer_event(sock, x, y, button_mask),
+            rfbClient.send_pointer_event(sock, x, y, 0),
+        ))
 
     def _send_ctrl_c(self):
-        def run():
-            try:
-                rfbClient.keydown(VNC_HOST, VNC_PORT, "Control_L", VNC_PASSWORD)
-                rfbClient.key(VNC_HOST, VNC_PORT, "c", VNC_PASSWORD)
-                rfbClient.keyup(VNC_HOST, VNC_PORT, "Control_L", VNC_PASSWORD)
-                print("[vncScreen] sent ctrl+c")
-            except Exception as e:
-                print(f"[vncScreen] ctrl+c failed: {e}")
-        threading.Thread(target=run, daemon=True).start()
+        self._vnc_call("ctrl+c", lambda sock: (
+            rfbClient.send_key_by_name(sock, "Control_L", True),
+            rfbClient.send_key_by_name(sock, "c", True),
+            rfbClient.send_key_by_name(sock, "c", False),
+            rfbClient.send_key_by_name(sock, "Control_L", False),
+        ))
 
     def _on_typed(self, host, wsapp, result):
         val = result.get("val", "")
         if val:
             print(f"[vncScreen] typing: {val!r}")
-            vnc_type(val)
+            self._vnc_type(val)
         host.send(wsapp, "text/set", {"key": "typed", "val": "", "acl": ["rw *"]})
         # Auto-return to the mirror after Send, through the same Lobby
         # flash as the explicit "Back to mirror" button, so you see the
@@ -426,8 +429,15 @@ class vncScreen():
     # --- capture loop (mirror only, paused while off the mirror screen) ---
 
     def _capture_frame(self):
-        image = rfbClient.capture(VNC_HOST, VNC_PORT, VNC_PASSWORD)
-        self._real_size = image.size
+        with self._vnc_lock:
+            sock = self._ensure_vnc_session()
+            if not sock:
+                raise ConnectionError("no VNC session")
+            try:
+                image = rfbClient.request_frame(sock, self._vnc_width, self._vnc_height, self._vnc_pixel_format)
+            except Exception:
+                self._vnc_sock = None
+                raise
         if image.width > MAX_WIDTH:
             scale = MAX_WIDTH / image.width
             image = image.resize((MAX_WIDTH, int(image.height * scale)))
@@ -463,12 +473,12 @@ class vncScreen():
         line = line.strip()
         if line == "stop":
             self._stop.set()
-            with self._mouse_lock:
-                if self._mouse_sock:
-                    self._mouse_sock.close()
-                    self._mouse_sock = None
+            with self._vnc_lock:
+                if self._vnc_sock:
+                    self._vnc_sock.close()
+                    self._vnc_sock = None
             print("[vncScreen] capture loop stopped")
         elif line.startswith("type "):
-            vnc_type(line[len("type "):])
+            self._vnc_type(line[len("type "):])
         elif line.startswith("key "):
-            vnc_key(line[len("key "):])
+            self._vnc_key(line[len("key "):])
